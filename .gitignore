@@ -4,3 +4,4 @@ __pycache__/
 .env
 discogs.db
 *.xml.gz
+*.log
