@@ -1,14 +1,16 @@
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import cover_fetcher
 import importer
 import matcher
-import cover_fetcher as dc_client
-from config import PORT
-from database import init_db, get_releases_count, get_meta
+from config import PORT, DISCOGS_TOKEN, INDEX_TRACKS, MATCH_THRESHOLD
+from database import init_db, get_conn, get_counts, get_meta
 
 
 @asynccontextmanager
@@ -21,13 +23,11 @@ app = FastAPI(title="dekkr-meta", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://*.vercel.app"],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.vercel\.app",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# --- Modèles ---
 
 class MatchRequest(BaseModel):
     artist: str
@@ -40,19 +40,19 @@ class BatchItem(BaseModel):
     title: str
 
 
-# --- Endpoints ---
-
 @app.get("/status")
 def status():
     imp = importer.get_progress()
+    counts = get_counts()
     return {
-        "db_ready": get_releases_count() > 0,
-        "releases_count": get_releases_count(),
+        "db_ready": counts["entries"] > 0,
+        "releases_count": counts["releases"],
+        "entries_count": counts["entries"],
         "dump_date": get_meta("dump_date"),
-        "import_running": imp["running"],
-        "import_step": imp["step"],
-        "import_inserted": imp["inserted"],
-        "import_error": imp["error"],
+        "index_tracks": INDEX_TRACKS,
+        "match_threshold": MATCH_THRESHOLD,
+        "discogs_token": bool(DISCOGS_TOKEN),
+        "import": imp,
     }
 
 
@@ -61,25 +61,35 @@ def match(req: MatchRequest):
     result = matcher.match_track(req.artist, req.title)
     if result is None:
         return {"matched": False, "score": 0}
-
-    url_cover = dc_client.get_cover_url(result["release_id"])
-    return {**result, "url_cover": url_cover}
+    return {**result, "url_cover": cover_fetcher.get_cover_url(result["release_id"])}
 
 
 @app.post("/match/batch")
-def match_batch(items: list[BatchItem]):
-    results = []
-    for i, item in enumerate(items):
-        result = matcher.match_track(item.artist, item.title)
-        if result is None:
-            results.append({"id": item.id, "matched": False})
-            continue
+def match_batch(items: list[BatchItem], covers: bool = True):
+    """Matche un lot. Les appels API pochettes sont cadencés à 1/s ;
+    les morceaux non matchés n'en consomment aucun."""
+    conn = get_conn()
+    fetch_covers = covers and bool(DISCOGS_TOKEN)
+    results, last_call = [], 0.0
 
-        # Rate limit : 1 appel API/s pour les pochettes
-        if i > 0:
-            time.sleep(1)
-        url_cover = dc_client.get_cover_url(result["release_id"])
-        results.append({"id": item.id, **result, "url_cover": url_cover})
+    try:
+        for item in items:
+            result = matcher.match_track(item.artist, item.title, conn=conn)
+            if result is None:
+                results.append({"id": item.id, "matched": False, "score": 0})
+                continue
+
+            url_cover = None
+            if fetch_covers:
+                wait = 1.0 - (time.monotonic() - last_call)
+                if wait > 0:
+                    time.sleep(wait)
+                url_cover = cover_fetcher.get_cover_url(result["release_id"])
+                last_call = time.monotonic()
+
+            results.append({"id": item.id, **result, "url_cover": url_cover})
+    finally:
+        conn.close()
 
     return results
 
@@ -92,21 +102,20 @@ def db_update(force: bool = False):
 
     dump_date = get_meta("dump_date")
     if dump_date and not force:
-        from datetime import datetime
         try:
             age = (datetime.utcnow() - datetime.strptime(dump_date, "%Y%m%d")).days
             if age < 31:
                 return {
                     "status": "skipped",
-                    "message": f"Dump récent ({age} jours). Passer force=true pour forcer."
+                    "message": f"Dump vieux de {age} jours. Utiliser force=true pour forcer.",
                 }
         except ValueError:
             pass
 
     importer.run_import()
-    return {"status": "started", "message": "Téléchargement du dump en cours..."}
+    return {"status": "started", "message": "Import lancé — suivre /status"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=PORT, reload=False)
+    uvicorn.run("main:app", host="127.0.0.1", port=PORT)

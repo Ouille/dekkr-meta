@@ -2,20 +2,31 @@ import sqlite3
 from config import DB_PATH
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+def get_conn(path: str | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(path or DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.executescript("""
+def tune_for_bulk(conn: sqlite3.Connection):
+    """Réglages SQLite pour un import massif (au prix de la durabilité)."""
+    conn.executescript("""
+        PRAGMA journal_mode = OFF;
+        PRAGMA synchronous = OFF;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -262144;   -- 256 Mo
+    """)
+
+
+def init_db(conn: sqlite3.Connection | None = None):
+    own = conn is None
+    conn = conn or get_conn()
+    conn.executescript("""
+        -- Métadonnées par sortie Discogs
         CREATE TABLE IF NOT EXISTS releases (
             release_id  INTEGER PRIMARY KEY,
-            artist      TEXT NOT NULL,
-            title       TEXT NOT NULL,
+            artist      TEXT,
+            title       TEXT,
             genre       TEXT,
             style       TEXT,
             year        INTEGER,
@@ -23,8 +34,18 @@ def init_db():
             country     TEXT
         );
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS releases_fts
-        USING fts5(artist, title, release_id UNINDEXED, content=releases, content_rowid=release_id);
+        -- Une ligne par couple (artiste, titre) cherchable.
+        -- Contient le titre de la sortie ET chaque titre de la tracklist.
+        CREATE TABLE IF NOT EXISTS entries (
+            id          INTEGER PRIMARY KEY,
+            release_id  INTEGER NOT NULL,
+            artist      TEXT NOT NULL,
+            title       TEXT NOT NULL
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts
+        USING fts5(artist, title, content='entries', content_rowid='id',
+                   tokenize='unicode61 remove_diacritics 2');
 
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
@@ -32,7 +53,13 @@ def init_db():
         );
     """)
     conn.commit()
-    conn.close()
+    if own:
+        conn.close()
+
+
+def rebuild_fts(conn: sqlite3.Connection):
+    conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+    conn.commit()
 
 
 def get_meta(key: str) -> str | None:
@@ -49,8 +76,12 @@ def set_meta(key: str, value: str):
     conn.close()
 
 
-def get_releases_count() -> int:
+def get_counts() -> dict:
     conn = get_conn()
-    row = conn.execute("SELECT COUNT(*) as cnt FROM releases").fetchone()
+    try:
+        rel = conn.execute("SELECT COUNT(*) c FROM releases").fetchone()["c"]
+        ent = conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"]
+    except sqlite3.OperationalError:
+        rel = ent = 0
     conn.close()
-    return row["cnt"]
+    return {"releases": rel, "entries": ent}

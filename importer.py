@@ -1,178 +1,294 @@
-import gzip
-import io
 import re
 import sqlite3
 import threading
+import time
 import xml.sax
 import xml.sax.handler
+import zlib
 import requests
-from datetime import datetime
-from config import DB_PATH, DUMP_URL
-from database import get_conn, set_meta
 
+from config import DUMP_INDEX, INDEX_TRACKS
+from database import get_conn, init_db, tune_for_bulk, rebuild_fts, set_meta
 
-# État de progression partagé
-progress: dict = {"running": False, "step": "", "inserted": 0, "error": None}
+# --- État de progression partagé ---
+_progress: dict = {
+    "running": False, "step": "", "releases": 0, "entries": 0,
+    "mb_read": 0.0, "error": None,
+}
 _lock = threading.Lock()
 
 
-def _set_progress(**kwargs):
+def _set(**kw):
     with _lock:
-        progress.update(kwargs)
+        _progress.update(kw)
 
 
 def get_progress() -> dict:
     with _lock:
-        return dict(progress)
+        return dict(_progress)
 
 
-def _latest_dump_url() -> str:
-    """Trouve l'URL du dump releases le plus récent sur data.discogs.com."""
-    now = datetime.utcnow()
-    for month_offset in range(3):
-        y = now.year
-        m = now.month - month_offset
-        if m <= 0:
-            m += 12
-            y -= 1
-        prefix = f"{y:04d}-{m:02d}"
-        url = f"{DUMP_URL}{prefix}/"
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                match = re.search(r'discogs_(\d{8})_releases\.xml\.gz', r.text)
-                if match:
-                    return f"{url}discogs_{match.group(1)}_releases.xml.gz", match.group(1)
-        except Exception:
-            pass
-    raise RuntimeError("Impossible de trouver le dump Discogs")
+# --- Résolution du dump le plus récent ---
+
+def resolve_latest_dump() -> tuple[str, str]:
+    """Retourne (url, date YYYYMMDD) du dump releases le plus récent."""
+    r = requests.get(DUMP_INDEX, timeout=30)
+    r.raise_for_status()
+    dates = sorted(set(re.findall(r"discogs_(\d{8})_releases\.xml\.gz", r.text)))
+    if not dates:
+        raise RuntimeError("Aucun dump releases trouvé sur data.discogs.com")
+    latest = dates[-1]
+    url = (
+        "https://data.discogs.com/?download=data%2F"
+        f"{latest[:4]}%2Fdiscogs_{latest}_releases.xml.gz"
+    )
+    return url, latest
 
 
-class _ReleaseHandler(xml.sax.handler.ContentHandler):
-    BATCH_SIZE = 5000
+# --- Parsing SAX ---
 
-    def __init__(self, conn: sqlite3.Connection):
+_YEAR = re.compile(r"(\d{4})")
+
+
+class ReleaseHandler(xml.sax.handler.ContentHandler):
+    """Extrait sorties + tracklist du dump Discogs.
+
+    Le suivi d'imbrication se fait par pile d'éléments : les balises homonymes
+    (`name` sous artist / company / label) sont ainsi désambiguïsées par leur
+    parent réel, pas par un drapeau global.
+    """
+
+    BATCH = 20_000
+
+    def __init__(self, conn: sqlite3.Connection, index_tracks: bool = True):
         self.conn = conn
         self.cur = conn.cursor()
-        self._reset()
-        self._batch: list[tuple] = []
-        self._count = 0
-        self._in: dict[str, bool] = {}
+        self.index_tracks = index_tracks
+        self.stack: list[str] = []
+        self.buf: list[str] = []
+        self._rel_batch: list[tuple] = []
+        self._ent_batch: list[tuple] = []
+        self.n_rel = 0
+        self.n_ent = 0
+        self._new_release()
 
-    def _reset(self):
-        self._id = None
-        self._title = ""
-        self._artists: list[str] = []
-        self._genres: list[str] = []
-        self._styles: list[str] = []
-        self._year = None
-        self._labels: list[str] = []
-        self._country = ""
-        self._buf = ""
-        self._in = {}
+    def _new_release(self):
+        self.rid = None
+        self.artist = None
+        self.title = None
+        self.genres: list[str] = []
+        self.styles: list[str] = []
+        self.year = None
+        self.label = None
+        self.country = None
+        self.tracks: list[str] = []
+
+    # -- SAX --
 
     def startElement(self, name, attrs):
-        self._in[name] = True
-        self._buf = ""
+        self.stack.append(name)
+        self.buf = []
+
         if name == "release":
-            self._reset()
-            self._id = int(attrs.get("id", 0))
+            self._new_release()
+            try:
+                self.rid = int(attrs.get("id") or 0)
+            except ValueError:
+                self.rid = None
+        elif name == "label" and self.label is None and self._parent() == "labels":
+            self.label = attrs.get("name")
 
     def characters(self, content):
-        self._buf += content
+        self.buf.append(content)
 
     def endElement(self, name):
-        self._in[name] = False
-        val = self._buf.strip()
+        val = "".join(self.buf).strip()
+        parent = self._parent()
+        gparent = self._grandparent()
 
-        if name == "title" and self._in.get("release") and not self._in.get("tracklist"):
-            self._title = val
-        elif name == "name" and self._in.get("artists") and not self._in.get("extraartists"):
-            self._artists.append(val)
-        elif name == "genre":
-            self._genres.append(val)
-        elif name == "style":
-            self._styles.append(val)
-        elif name == "year":
-            try:
-                self._year = int(val)
-            except ValueError:
-                pass
-        elif name == "name" and self._in.get("labels"):
-            self._labels.append(val)
-        elif name == "country":
-            self._country = val
+        if name == "title" and parent == "release":
+            self.title = val
+        elif name == "name" and parent == "artist" and gparent == "artists":
+            if self.artist is None:
+                self.artist = val
+        elif name == "genre" and parent == "genres":
+            self.genres.append(val)
+        elif name == "style" and parent == "styles":
+            self.styles.append(val)
+        elif name == "country" and parent == "release":
+            self.country = val
+        elif name == "released" and parent == "release":
+            m = _YEAR.search(val)
+            if m:
+                self.year = int(m.group(1))
+        elif name == "title" and parent == "track":
+            if val:
+                self.tracks.append(val)
         elif name == "release":
-            if self._id and self._title and self._artists:
-                self._batch.append((
-                    self._id,
-                    self._artists[0],
-                    self._title,
-                    "|".join(self._genres) or None,
-                    "|".join(self._styles) or None,
-                    self._year,
-                    self._labels[0] if self._labels else None,
-                    self._country or None,
-                ))
-            if len(self._batch) >= self.BATCH_SIZE:
-                self._flush()
+            self._emit()
 
-        self._buf = ""
-
-    def _flush(self):
-        self.cur.executemany(
-            "INSERT OR REPLACE INTO releases VALUES (?,?,?,?,?,?,?,?)",
-            self._batch,
-        )
-        self.conn.commit()
-        self._count += len(self._batch)
-        _set_progress(inserted=self._count)
-        self._batch.clear()
+        self.buf = []
+        if self.stack:
+            self.stack.pop()
 
     def endDocument(self):
-        if self._batch:
+        self._flush()
+
+    def _parent(self) -> str | None:
+        return self.stack[-2] if len(self.stack) >= 2 else None
+
+    def _grandparent(self) -> str | None:
+        return self.stack[-3] if len(self.stack) >= 3 else None
+
+    # -- Écriture --
+
+    def _emit(self):
+        if not self.rid or not self.artist:
+            return
+
+        self._rel_batch.append((
+            self.rid, self.artist, self.title,
+            "|".join(self.genres) or None,
+            "|".join(self.styles) or None,
+            self.year, self.label, self.country,
+        ))
+        self.n_rel += 1
+
+        # Couples cherchables : titre de la sortie + chaque titre de morceau.
+        seen: set[str] = set()
+        titles = [self.title] if self.title else []
+        if self.index_tracks:
+            titles += self.tracks
+        for t in titles:
+            k = t.casefold()
+            if k in seen:
+                continue
+            seen.add(k)
+            self._ent_batch.append((self.rid, self.artist, t))
+        self.n_ent += len(seen)
+
+        if len(self._ent_batch) >= self.BATCH:
             self._flush()
 
+    def _flush(self):
+        if self._rel_batch:
+            self.cur.executemany(
+                "INSERT OR REPLACE INTO releases VALUES (?,?,?,?,?,?,?,?)",
+                self._rel_batch,
+            )
+            self._rel_batch.clear()
+        if self._ent_batch:
+            self.cur.executemany(
+                "INSERT INTO entries (release_id, artist, title) VALUES (?,?,?)",
+                self._ent_batch,
+            )
+            self._ent_batch.clear()
+        self.conn.commit()
+        _set(releases=self.n_rel, entries=self.n_ent)
 
-def _rebuild_fts(conn: sqlite3.Connection):
-    conn.execute("INSERT INTO releases_fts(releases_fts) VALUES('rebuild')")
+
+# --- Flux gzip depuis HTTP, décompressé à la volée ---
+
+class _GzipStream:
+    """Fichier-like qui décompresse le dump au fil du téléchargement."""
+
+    def __init__(self, response, max_bytes: int | None = None, on_read=None):
+        self._it = response.iter_content(chunk_size=1 << 20)
+        self._d = zlib.decompressobj(31)
+        self._buf = b""
+        self._raw = 0
+        self._max = max_bytes
+        self._on_read = on_read
+        self._done = False
+
+    def read(self, size: int = -1) -> bytes:
+        while not self._done and (size < 0 or len(self._buf) < size):
+            if self._max is not None and self._raw >= self._max:
+                self._done = True
+                break
+            try:
+                chunk = next(self._it)
+            except StopIteration:
+                self._done = True
+                break
+            self._raw += len(chunk)
+            if self._on_read:
+                self._on_read(self._raw)
+            self._buf += self._d.decompress(chunk)
+
+        if size < 0:
+            out, self._buf = self._buf, b""
+        else:
+            out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+    def close(self):
+        self._done = True
+        self._buf = b""
+
+
+def import_dump(url: str, db_path: str | None = None,
+                max_bytes: int | None = None,
+                index_tracks: bool = INDEX_TRACKS) -> dict:
+    """Importe le dump. `max_bytes` limite l'octet compressé lu (benchmark)."""
+    t0 = time.time()
+    conn = get_conn(db_path)
+    tune_for_bulk(conn)
+    init_db(conn)
+    conn.execute("DELETE FROM entries")
+    conn.execute("DELETE FROM releases")
     conn.commit()
 
+    handler = ReleaseHandler(conn, index_tracks=index_tracks)
+    parser = xml.sax.make_parser()
+    parser.setContentHandler(handler)
+
+    def _tick(raw):
+        _set(mb_read=round(raw / 1024 / 1024, 1))
+
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        _set(step="Import en cours…")
+        stream = _GzipStream(r, max_bytes=max_bytes, on_read=_tick)
+        try:
+            parser.parse(stream)
+        except xml.sax.SAXParseException:
+            # Flux tronqué volontairement (mode benchmark) : normal.
+            if max_bytes is None:
+                raise
+            handler._flush()
+
+    parse_s = time.time() - t0
+    _set(step="Construction de l'index de recherche…")
+    rebuild_fts(conn)
+    conn.close()
+
+    return {
+        "releases": handler.n_rel,
+        "entries": handler.n_ent,
+        "mb_compressed": round(_progress["mb_read"], 1),
+        "total_mb": round(total / 1024 / 1024, 1) if total else None,
+        "parse_seconds": round(parse_s, 1),
+        "total_seconds": round(time.time() - t0, 1),
+    }
+
+
+# --- Lancement asynchrone (API) ---
 
 def run_import():
-    """Lance l'import dans un thread séparé."""
-    t = threading.Thread(target=_do_import, daemon=True)
-    t.start()
+    threading.Thread(target=_do_import, daemon=True).start()
 
 
 def _do_import():
-    _set_progress(running=True, step="Recherche du dump...", inserted=0, error=None)
+    _set(running=True, step="Recherche du dump…", releases=0, entries=0,
+         mb_read=0.0, error=None)
     try:
-        url, date_str = _latest_dump_url()
-        _set_progress(step=f"Téléchargement {url}...")
-
-        conn = get_conn()
-        # Vider les tables avant ré-import
-        conn.execute("DELETE FROM releases")
-        conn.execute("INSERT INTO releases_fts(releases_fts) VALUES('delete-all')")
-        conn.commit()
-
-        handler = _ReleaseHandler(conn)
-        parser = xml.sax.make_parser()
-        parser.setContentHandler(handler)
-
-        with requests.get(url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            _set_progress(step="Import en cours...")
-            with gzip.open(io.BufferedReader(r.raw), "rb") as gz:
-                parser.parse(gz)
-
-        _set_progress(step="Reconstruction index FTS...")
-        _rebuild_fts(conn)
-        conn.close()
-
+        url, date_str = resolve_latest_dump()
+        _set(step=f"Dump {date_str} — téléchargement…")
+        import_dump(url)
         set_meta("dump_date", date_str)
-        _set_progress(running=False, step="Terminé")
-
+        set_meta("index_tracks", "1" if INDEX_TRACKS else "0")
+        _set(running=False, step="Terminé")
     except Exception as e:
-        _set_progress(running=False, step="Erreur", error=str(e))
+        _set(running=False, step="Erreur", error=str(e))
