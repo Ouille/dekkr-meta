@@ -51,12 +51,17 @@ venv\Scripts\python import_cli.py
 
 Télécharge le dump le plus récent et le charge en SQLite.
 
+Mesuré sur le dump `20260701` :
+
 | | |
 | :--- | :--- |
-| Téléchargement | ~10,4 Go compressés |
-| Durée | ~1 h (limitée par le débit réseau) |
-| Base produite | ~9,8 Go |
-| Contenu | ~16,8 M sorties, ~107 M couples artiste/titre |
+| Téléchargement | 10,4 Go compressés |
+| Durée | 47 min (40 min de lecture + 7 min d'index) |
+| Base produite | **16,9 Go** |
+| Contenu | 19,3 M sorties, 187 M couples artiste/titre |
+| Complétude | label 100 %, genre 100 %, style 97,7 %, année 97,7 % |
+
+Prévoir ~20 Go d'espace libre.
 
 Pour un essai rapide sans tout télécharger :
 
@@ -85,8 +90,8 @@ venv\Scripts\python main.py
 ```json
 {
   "db_ready": true,
-  "releases_count": 16800000,
-  "entries_count": 107000000,
+  "releases_count": 19267094,
+  "entries_count": 187070107,
   "dump_date": "20260701",
   "discogs_token": true,
   "import": { "running": false, "step": "Terminé" }
@@ -135,8 +140,8 @@ Relance l'import en tâche de fond. Refuse un dump de moins de 31 jours sauf
 Un DJ possède des **morceaux** ; Discogs indexe des **sorties**. Un fichier
 « The Persuader — Östermalm » n'apparaît nulle part dans le titre de la sortie,
 qui est « Stockholm ». La table `entries` contient donc, pour chaque sortie, le
-titre de la sortie **et** chaque titre de sa tracklist — soit ~6,4 lignes par
-sortie.
+titre de la sortie **et** chaque titre de sa tracklist — soit 9,7 lignes par
+sortie en moyenne.
 
 1. **Normalisation** — retrait des numéros de piste en préfixe, des mentions
    `(Original Mix)`, `[Remix]`, `feat. X`, de la ponctuation et de la casse.
