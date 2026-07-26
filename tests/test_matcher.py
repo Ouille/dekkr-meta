@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-from matcher import normalize, _artist_score, _tokens  # noqa: E402
+from matcher import normalize, normalize_artist, _artist_score, _tokens  # noqa: E402
 
 
 class TestNormalize:
@@ -106,6 +106,43 @@ class TestArtistScore:
         """Un nom trop banal est contenu partout : sans garde-fou il
         s'apparierait avec n'importe quel artiste."""
         assert _artist_score(court, "the chemical brothers") < 100.0
+
+    @pytest.mark.parametrize("discogs, fichier", [
+        ("Yak (19)", "yak"),
+        ("PAX (11)", "pax"),
+        ("Guz (12)", "guz"),
+        ("Culture Shock (2)", "culture shock sub focus"),
+        ("Omis (2)", "omis italy"),
+    ])
+    def test_suffixe_homonymie_ignore(self, discogs, fichier):
+        """« (19) » numérote les homonymes chez Discogs : c'est sa
+        comptabilité interne, pas le nom de l'artiste. Les chiffres survivant
+        au découpage en jetons, le garder faisait chuter le score."""
+        assert _artist_score(discogs, fichier) == 100.0
+
+    @pytest.mark.parametrize("discogs, fichier", [
+        ("Robert Hood", "moon rocket"),
+        ("Reminder", "strinner"),
+    ])
+    def test_artiste_etranger_sous_le_plancher(self, discogs, fichier):
+        """Ces deux-là passaient sur la seule force du titre : un titre
+        parfait rapporte 60 des 100 points. Ils doivent rester sous le
+        plancher de 70."""
+        assert _artist_score(discogs, fichier) < 70
+
+
+class TestNormalizeArtist:
+    def test_suffixe_retire(self):
+        assert normalize_artist("Yak (19)") == "yak"
+        assert normalize_artist("Culture Shock (2)") == "culture shock"
+
+    def test_parenthese_non_numerique_conservee(self):
+        """« (Italy) » vient du fichier et distingue un homonyme :
+        contrairement à « (2) », il porte de l'information."""
+        assert "italy" in normalize_artist("Omis (Italy)")
+
+    def test_sans_suffixe_inchange(self):
+        assert normalize_artist("Daft Punk") == normalize("Daft Punk")
 
 
 class TestTokens:

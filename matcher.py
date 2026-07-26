@@ -29,6 +29,9 @@ _TAIL_GENERIC = re.compile(
 )
 _TAIL_ORIGINAL = re.compile(r"\s+original\s*$", re.IGNORECASE)
 
+# Suffixe d'homonymie propre à Discogs : « Yak (19) », « Culture Shock (2) ».
+_DISAMBIG = re.compile(r"\s*\(\d+\)\s*$")
+
 
 def _fold(text: str) -> str:
     """Replie les diacritiques — « Rüfüs » et « RUFUS » doivent se rejoindre.
@@ -62,6 +65,17 @@ def _fts_group(tokens: list[str]) -> str:
     return " ".join(f'"{t}"' for t in tokens)
 
 
+def normalize_artist(text: str) -> str:
+    """Comme `normalize`, mais retire le suffixe d'homonymie de Discogs.
+
+    Discogs numérote les artistes homonymes : « Yak (19) », « PAX (11) ».
+    C'est de la comptabilité interne à sa base, pas une partie du nom — et
+    comme les chiffres survivent au découpage en jetons, le laisser faisait
+    chuter le score d'un artiste pourtant identique.
+    """
+    return normalize(_DISAMBIG.sub("", text or ""))
+
+
 def _artist_score(cand: str, q_artist: str) -> float:
     """Score d'artiste tolérant aux fichiers multi-artistes.
 
@@ -70,7 +84,7 @@ def _artist_score(cand: str, q_artist: str) -> float:
     l'artiste Discogs est intégralement contenu dans celui du fichier, c'est
     la même sortie : on ne pénalise pas les noms surnuméraires.
     """
-    c = normalize(cand)
+    c = normalize_artist(cand)
     base = fuzz.token_sort_ratio(c, q_artist)
 
     ct, qt = set(_tokens(c)), set(_tokens(q_artist))
@@ -135,9 +149,20 @@ def match_track(artist: str, title: str, conn: sqlite3.Connection | None = None,
 
     rows = _candidates(conn, q_artist, q_title, limit)
 
+    # Plancher d'artiste : un titre parfait rapporte déjà 60 points sur 100,
+    # si bien qu'une ressemblance d'artiste de 62 % suffisait à passer le seuil.
+    # Sur un titre courant — « Intro » compte 458 000 entrées — on finissait
+    # toujours par trouver quelqu'un. Une correspondance dont l'artiste diffère
+    # n'a pas de sens : on l'écarte avant de comparer.
+    floor = cfg.min_artist_score
+
     best, best_score = None, 0.0
     for row in rows:
-        s = _score(row["artist"], row["title"], q_artist, q_title)
+        sa = _artist_score(row["artist"], q_artist)
+        if sa < floor:
+            continue
+        st = fuzz.token_sort_ratio(normalize(row["title"]), q_title)
+        s = sa * 0.4 + st * 0.6
         if s > best_score:
             best, best_score = row, s
 

@@ -70,6 +70,10 @@ def _default_db_path() -> str:
 class Config:
     port: int = 7433
     match_threshold: int = 85
+    # Ressemblance minimale de l'artiste. Une correspondance fondée sur le seul
+    # titre n'a pas de sens : le titre pèse 60 % du score, donc sans plancher un
+    # artiste à 62 % suffisait à passer. Voir `matcher.match_track`.
+    min_artist_score: int = 70
     discogs_token: str = ""
     db_path: str = field(default_factory=_default_db_path)
     index_tracks: bool = True
