@@ -1,5 +1,6 @@
 import re
 import sqlite3
+import unicodedata
 from rapidfuzz import fuzz
 
 from config import cfg
@@ -13,8 +14,32 @@ _PAREN = re.compile(
 )
 _FEAT = re.compile(r"\s+(feat\.?|ft\.?|featuring)\s+.+$", re.IGNORECASE)
 _LEAD_NUM = re.compile(r"^\s*\d{1,3}\s*[-._)]\s*")
-_PUNCT = re.compile(r"[^\w\s&]", re.UNICODE)
+# Le tiret bas est un caractère de mot pour `\w` : sans le citer explicitement,
+# « Original_Mix » resterait un seul jeton et échapperait au nettoyage.
+_PUNCT = re.compile(r"[^\w\s&]|_", re.UNICODE)
 _WS = re.compile(r"\s+")
+
+# Mentions génériques en fin de titre, sans parenthèses : « Weltschmerz Original
+# Mix ». L'adjectif est obligatoire : « Pastor Remix » distingue une version et
+# doit être conservé, contrairement à « Original Mix » qui n'apprend rien.
+_TAIL_GENERIC = re.compile(
+    r"\s+(original|album|single|radio|extended|club|full|maxi|vocal)"
+    r"\s+(mix|edit|version|cut)\s*$",
+    re.IGNORECASE,
+)
+_TAIL_ORIGINAL = re.compile(r"\s+original\s*$", re.IGNORECASE)
+
+
+def _fold(text: str) -> str:
+    """Replie les diacritiques — « Rüfüs » et « RUFUS » doivent se rejoindre.
+
+    L'index FTS est construit avec `remove_diacritics 2` ; sans ce repli côté
+    Python, la présélection trouvait le candidat mais le score le rejetait.
+    """
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(c)
+    )
 
 
 def normalize(text: str) -> str:
@@ -22,7 +47,11 @@ def normalize(text: str) -> str:
     text = _PAREN.sub(" ", text)
     text = _FEAT.sub("", text)
     text = _PUNCT.sub(" ", text)
-    return _WS.sub(" ", text).strip().casefold()
+    text = _WS.sub(" ", text).strip()
+    for _ in range(2):  # « … Original Mix » peut suivre « … Original »
+        text = _TAIL_GENERIC.sub("", text)
+        text = _TAIL_ORIGINAL.sub("", text)
+    return _fold(text).strip().casefold()
 
 
 def _tokens(text: str) -> list[str]:
@@ -33,8 +62,30 @@ def _fts_group(tokens: list[str]) -> str:
     return " ".join(f'"{t}"' for t in tokens)
 
 
+def _artist_score(cand: str, q_artist: str) -> float:
+    """Score d'artiste tolérant aux fichiers multi-artistes.
+
+    Un fichier annonce souvent tous les intervenants (« Cari Golden, niiche »)
+    là où Discogs n'enregistre que l'artiste principal (« Niiche »). Quand
+    l'artiste Discogs est intégralement contenu dans celui du fichier, c'est
+    la même sortie : on ne pénalise pas les noms surnuméraires.
+    """
+    c = normalize(cand)
+    base = fuzz.token_sort_ratio(c, q_artist)
+
+    ct, qt = set(_tokens(c)), set(_tokens(q_artist))
+    if not ct or not qt or ct == qt:
+        return base
+
+    # Garde-fou : un candidat trop court ou trop banal serait inclus partout.
+    substantial = len(c.replace(" ", "")) >= 4 and any(len(t) >= 3 for t in ct)
+    if substantial and ct <= qt:
+        return 100.0
+    return base
+
+
 def _score(cand_artist: str, cand_title: str, q_artist: str, q_title: str) -> float:
-    sa = fuzz.token_sort_ratio(normalize(cand_artist), q_artist)
+    sa = _artist_score(cand_artist, q_artist)
     st = fuzz.token_sort_ratio(normalize(cand_title), q_title)
     return sa * 0.4 + st * 0.6
 
