@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+discogs.db
+*.xml.gz
