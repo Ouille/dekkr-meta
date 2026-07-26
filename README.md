@@ -29,21 +29,48 @@ son code.
 
 ## Installation
 
+### Application Windows (recommandé)
+
+Récupérer `dekkr-meta.exe` depuis les *Releases*, puis le lancer. Une icône
+apparaît dans la barre des tâches. Au premier lancement, la base est absente :
+clic droit sur l'icône → **Importer la base Discogs**.
+
+L'icône indique l'état d'un coup d'œil :
+
+| Couleur | État |
+| :--- | :--- |
+| 🟠 orange | base absente — import à lancer |
+| 🟡 jaune | import en cours |
+| 🟢 vert | base prête, service opérationnel |
+| 🔴 rouge | erreur |
+
+Le menu donne accès à la fenêtre de statut, aux paramètres (emplacement de la
+base, jeton Discogs, seuil, port) et au démarrage automatique avec Windows.
+
+La configuration est enregistrée dans
+`%APPDATA%\dekkr-meta\config.json`.
+
+### Depuis les sources
+
 ```bash
-git clone <repo> dekkr-meta
+git clone https://github.com/Ouille/dekkr-meta
 cd dekkr-meta
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
-copy .env.example .env
+venv\Scripts\python main.py
 ```
 
-Renseigner `DISCOGS_TOKEN` dans `.env` (facultatif — sert uniquement aux
-pochettes). Le jeton personnel se génère sur
-<https://www.discogs.com/settings/developers>.
+Pour reconstruire l'exécutable :
+
+```bash
+venv\Scripts\pyinstaller build.spec --noconfirm --clean
+```
 
 ---
 
 ## Import de la base
+
+Depuis l'icône de la barre des tâches, ou en ligne de commande :
 
 ```bash
 venv\Scripts\python import_cli.py
@@ -73,11 +100,14 @@ venv\Scripts\python import_cli.py --slice-mb 120
 
 ## Lancement du service
 
-```bash
-venv\Scripts\python main.py
-```
+L'exécutable démarre le service automatiquement. Il écoute sur
+`http://127.0.0.1:7433` ; la documentation interactive est sur `/docs`.
 
-Écoute sur `http://127.0.0.1:7433`. Documentation interactive sur `/docs`.
+Pour lancer l'API seule, sans icône ni fenêtres :
+
+```bash
+venv\Scripts\python server.py
+```
 
 ---
 
@@ -157,13 +187,27 @@ sortie en moyenne.
 
 ## Configuration
 
-| Variable | Défaut | Rôle |
+Réglable depuis **Paramètres** (menu de l'icône), ou directement dans
+`%APPDATA%\dekkr-meta\config.json` :
+
+| Clé | Défaut | Rôle |
 | :--- | :--- | :--- |
-| `PORT` | `7433` | port d'écoute |
-| `MATCH_THRESHOLD` | `85` | score minimum retenu |
-| `DISCOGS_TOKEN` | — | jeton personnel, requis pour les pochettes |
-| `DB_PATH` | `discogs.db` | emplacement de la base |
-| `INDEX_TRACKS` | `1` | indexer les tracklists (⚠️ à `0`, seuls les titres de sortie sont cherchables) |
+| `port` | `7433` | port d'écoute (redémarrage requis) |
+| `match_threshold` | `85` | score minimum retenu |
+| `discogs_token` | — | jeton personnel, requis pour les pochettes |
+| `db_path` | voir ci-dessous | emplacement de la base |
+| `index_tracks` | `true` | indexer les tracklists (⚠️ à `false`, seuls les titres de sortie sont cherchables) |
+| `autostart` | `false` | démarrage avec Windows |
+
+Au tout premier lancement, une base `discogs.db` déjà présente à côté de
+l'exécutable, dans son dossier parent ou dans le dossier courant est adoptée
+plutôt que réclamée — un import coûte une heure. À défaut, la base est créée
+dans `%APPDATA%\dekkr-meta\`. Le chemin retenu est ensuite figé dans
+`config.json` ; **Paramètres** permet d'en désigner un autre, y compris sur un
+autre disque.
+
+Les variables d'environnement `PORT`, `MATCH_THRESHOLD`, `DISCOGS_TOKEN` et
+`DB_PATH` restent prioritaires, pour le développement.
 
 ---
 

@@ -1,3 +1,4 @@
+import os
 import re
 import sqlite3
 import threading
@@ -7,7 +8,7 @@ import xml.sax.handler
 import zlib
 import requests
 
-from config import DUMP_INDEX, INDEX_TRACKS
+from config import DUMP_INDEX, cfg
 from database import get_conn, init_db, tune_for_bulk, rebuild_fts, set_meta
 
 # --- État de progression partagé ---
@@ -229,10 +230,17 @@ class _GzipStream:
 
 def import_dump(url: str, db_path: str | None = None,
                 max_bytes: int | None = None,
-                index_tracks: bool = INDEX_TRACKS) -> dict:
+                index_tracks: bool | None = None) -> dict:
     """Importe le dump. `max_bytes` limite l'octet compressé lu (benchmark)."""
+    if index_tracks is None:
+        index_tracks = cfg.index_tracks
+
     t0 = time.time()
-    conn = get_conn(db_path)
+    target = db_path or cfg.db_path
+    parent = os.path.dirname(os.path.abspath(target))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = get_conn(target)
     tune_for_bulk(conn)
     init_db(conn)
     conn.execute("DELETE FROM entries")
@@ -276,19 +284,26 @@ def import_dump(url: str, db_path: str | None = None,
 
 # --- Lancement asynchrone (API) ---
 
-def run_import():
-    threading.Thread(target=_do_import, daemon=True).start()
+def run_import(on_done=None):
+    threading.Thread(target=_do_import, args=(on_done,), daemon=True).start()
 
 
-def _do_import():
+def _do_import(on_done=None):
     _set(running=True, step="Recherche du dump…", releases=0, entries=0,
          mb_read=0.0, error=None)
+    err = None
     try:
         url, date_str = resolve_latest_dump()
         _set(step=f"Dump {date_str} — téléchargement…")
         import_dump(url)
         set_meta("dump_date", date_str)
-        set_meta("index_tracks", "1" if INDEX_TRACKS else "0")
+        set_meta("index_tracks", "1" if cfg.index_tracks else "0")
         _set(running=False, step="Terminé")
     except Exception as e:
-        _set(running=False, step="Erreur", error=str(e))
+        err = str(e)
+        _set(running=False, step="Erreur", error=err)
+    if on_done:
+        try:
+            on_done(err)
+        except Exception:
+            pass

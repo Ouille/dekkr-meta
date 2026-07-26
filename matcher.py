@@ -2,7 +2,7 @@ import re
 import sqlite3
 from rapidfuzz import fuzz
 
-from config import MATCH_THRESHOLD
+from config import cfg
 from database import get_conn
 
 # Bruit courant dans les noms de fichiers DJ : (Original Mix), [Remix], feat. X…
@@ -74,7 +74,7 @@ def match_track(artist: str, title: str, conn: sqlite3.Connection | None = None,
                 threshold: int | None = None, limit: int = 200) -> dict | None:
     own = conn is None
     conn = conn or get_conn()
-    threshold = MATCH_THRESHOLD if threshold is None else threshold
+    threshold = cfg.match_threshold if threshold is None else threshold
 
     q_artist, q_title = normalize(artist), normalize(title)
     if not q_title and not q_artist:

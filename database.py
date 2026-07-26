@@ -1,9 +1,9 @@
 import sqlite3
-from config import DB_PATH
+from config import cfg
 
 
 def get_conn(path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or DB_PATH)
+    conn = sqlite3.connect(path or cfg.db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
