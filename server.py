@@ -1,5 +1,6 @@
 """API HTTP de dekkr-meta (FastAPI)."""
 
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -42,6 +43,11 @@ class BatchItem(BaseModel):
     title: str
 
 
+class CoverItem(BaseModel):
+    id: str
+    release_id: int
+
+
 @app.get("/status")
 def status():
     counts = get_counts() if cfg.db_exists else {"releases": 0, "entries": 0}
@@ -76,6 +82,27 @@ def match(req: MatchRequest):
     return {**result, "url_cover": cover_fetcher.get_cover_url(result["release_id"])}
 
 
+_pace_lock = threading.Lock()
+_pace_last = 0.0
+
+
+def _pace_discogs() -> None:
+    """Attend son tour avant un appel à l'API Discogs (1 par seconde).
+
+    Le quota authentifié (60/min) est **global au jeton** : un cadenceur par
+    requête HTTP le dépasserait dès que deux lots se chevauchent — et FastAPI
+    sert les endpoints synchrones dans un pool de threads, donc le cas se
+    produit. Le verrou est tenu pendant l'attente, ce qui sérialise
+    volontairement les appels sortants.
+    """
+    global _pace_last
+    with _pace_lock:
+        delay = 1.0 - (time.monotonic() - _pace_last)
+        if delay > 0:
+            time.sleep(delay)
+        _pace_last = time.monotonic()
+
+
 @app.post("/match/batch")
 def match_batch(items: list[BatchItem], covers: bool = True):
     """Matche un lot. Les appels API pochettes sont cadencés à 1/s ;
@@ -83,7 +110,7 @@ def match_batch(items: list[BatchItem], covers: bool = True):
     _require_db()
     conn = get_conn()
     fetch_covers = covers and bool(cfg.discogs_token)
-    results, last_call = [], 0.0
+    results = []
 
     try:
         for item in items:
@@ -94,16 +121,41 @@ def match_batch(items: list[BatchItem], covers: bool = True):
 
             url_cover = None
             if fetch_covers:
-                wait = 1.0 - (time.monotonic() - last_call)
-                if wait > 0:
-                    time.sleep(wait)
+                _pace_discogs()
                 url_cover = cover_fetcher.get_cover_url(result["release_id"])
-                last_call = time.monotonic()
 
             results.append({"id": item.id, **result, "url_cover": url_cover})
     finally:
         conn.close()
 
+    return results
+
+
+@app.post("/covers")
+def covers(items: list[CoverItem]):
+    """URLs de pochettes pour des releases **déjà appariées** — SPEC-META-001, tâche 10.
+
+    Endpoint distinct de `/match/batch` : l'appelant connaît déjà ses
+    `release_id`, et rejouer tout le matching pour rafraîchir des pochettes
+    coûterait cher pour rien. Cela découple surtout les deux rythmes — le
+    matching répond en millisecondes, les pochettes en une seconde par morceau.
+
+    Rend une entrée par `id` demandé, `failed` distinguant une **absence
+    certaine** (`url_cover: null, failed: false` — la release n'a pas d'image)
+    d'un **incident passager** (`failed: true`), que l'appelant ne doit pas
+    mémoriser comme définitif.
+    """
+    if not cfg.discogs_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Jeton Discogs absent — le renseigner dans les Paramètres de dekkr-meta",
+        )
+
+    results = []
+    for item in items:
+        _pace_discogs()
+        res = cover_fetcher.fetch_cover(item.release_id)
+        results.append({"id": item.id, "url_cover": res.url, "failed": res.failed})
     return results
 
 

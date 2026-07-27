@@ -214,24 +214,61 @@ def open_settings_window(on_saved=None) -> None:
         btns.pack(side="bottom", fill="x", pady=(14, 0))
 
         def save():
-            new_path = path_var.get().strip()
-            if new_path and new_path != cfg.db_path:
-                if not os.path.exists(new_path):
-                    ok = messagebox.askyesno(
-                        APP_TITLE,
-                        "Aucune base à cet emplacement.\n\n"
-                        "Un nouvel import sera nécessaire (~1 h, 10 Go de "
-                        "téléchargement). Confirmer le changement ?",
-                        parent=win,
-                    )
-                    if not ok:
-                        return
-                cfg.db_path = new_path
+            # 🔴 Tout est LU et validé avant que `cfg` ne soit touché.
+            #
+            # L'ordre inverse a coûté un jeton Discogs : `cfg.discogs_token` était
+            # affecté d'abord, puis `thr_var.get()` levait un `TclError` (un `IntVar`
+            # lève dès que le Spinbox contient autre chose qu'un entier). Le jeton
+            # vivait alors en mémoire — `/status` le déclarait présent, les pochettes
+            # marchaient — sans jamais atteindre le disque, et il disparaissait au
+            # redémarrage suivant. L'exe étant compilé sans console, l'exception
+            # partait dans le vide : aucun message, aucune trace.
+            try:
+                new_token = token_var.get().strip()
+                new_threshold = int(thr_var.get())
+                new_port = int(port_var.get())
+            except (tk.TclError, ValueError):
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Seuil et port doivent être des nombres entiers.\n\n"
+                    "Aucun réglage n'a été modifié.",
+                    parent=win,
+                )
+                return
 
-            cfg.discogs_token = token_var.get().strip()
-            cfg.match_threshold = int(thr_var.get())
-            cfg.port = int(port_var.get())
-            save_config(cfg)
+            new_path = path_var.get().strip()
+            path_changed = bool(new_path) and new_path != cfg.db_path
+            if path_changed and not os.path.exists(new_path):
+                ok = messagebox.askyesno(
+                    APP_TITLE,
+                    "Aucune base à cet emplacement.\n\n"
+                    "Un nouvel import sera nécessaire (~1 h, 10 Go de "
+                    "téléchargement). Confirmer le changement ?",
+                    parent=win,
+                )
+                if not ok:
+                    return
+
+            # À partir d'ici, plus rien ne peut échouer à mi-chemin.
+            if path_changed:
+                cfg.db_path = new_path
+            cfg.discogs_token = new_token
+            cfg.match_threshold = new_threshold
+            cfg.port = new_port
+
+            try:
+                save_config(cfg)
+            except OSError as e:
+                # L'écriture est le seul geste réellement faillible qui reste. Le dire,
+                # plutôt que de laisser croire à un enregistrement qui n'a pas eu lieu.
+                messagebox.showerror(
+                    APP_TITLE,
+                    f"Réglages non enregistrés :\n{e}\n\n"
+                    "Ils resteront actifs jusqu'à la fermeture de dekkr-meta.",
+                    parent=win,
+                )
+                return
+
             if on_saved:
                 on_saved()
             win.destroy()
