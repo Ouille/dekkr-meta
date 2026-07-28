@@ -85,9 +85,21 @@ def match(req: MatchRequest):
 _pace_lock = threading.Lock()
 _pace_last = 0.0
 
+#: Secondes entre deux départs d'appel Discogs.
+#
+# 🔴 1,0 s = 60 appels/min = **exactement** le quota authentifié Discogs, sur une
+# fenêtre glissante. Se placer pile à la limite ne laisse aucune marge : mesuré au
+# terrain le 2026-07-28, environ **58 % des appels échouaient** sur trois passes de
+# tailles très différentes (608, 455 puis 260 cibles). Un taux constant quelle que
+# soit la longueur de la série : l'échec est par APPEL, pas un incident de parcours.
+#
+# 1,2 s ramène à 50/min, sous la limite. On paie ~20 % de temps par passe, contre
+# les deux à trois passes complètes que coûtait le taux d'échec.
+PACE_SECONDS = 1.2
+
 
 def _pace_discogs() -> None:
-    """Attend son tour avant un appel à l'API Discogs (1 par seconde).
+    """Attend son tour avant un appel à l'API Discogs (voir `PACE_SECONDS`).
 
     Le quota authentifié (60/min) est **global au jeton** : un cadenceur par
     requête HTTP le dépasserait dès que deux lots se chevauchent — et FastAPI
@@ -97,7 +109,7 @@ def _pace_discogs() -> None:
     """
     global _pace_last
     with _pace_lock:
-        delay = 1.0 - (time.monotonic() - _pace_last)
+        delay = PACE_SECONDS - (time.monotonic() - _pace_last)
         if delay > 0:
             time.sleep(delay)
         _pace_last = time.monotonic()
@@ -144,6 +156,11 @@ def covers(items: list[CoverItem]):
     certaine** (`url_cover: null, failed: false` — la release n'a pas d'image)
     d'un **incident passager** (`failed: true`), que l'appelant ne doit pas
     mémoriser comme définitif.
+
+    🔴 `error` porte la CAUSE de l'échec jusqu'au client. Elle ne peut pas être
+    journalisée sur place : l'exe est construit `console=False`, une trace
+    imprimée n'irait nulle part. Sans elle, 156 échecs se lisent « réseau ou
+    quota » — deux corrections opposées pour un même message.
     """
     if not cfg.discogs_token:
         raise HTTPException(
@@ -155,7 +172,12 @@ def covers(items: list[CoverItem]):
     for item in items:
         _pace_discogs()
         res = cover_fetcher.fetch_cover(item.release_id)
-        results.append({"id": item.id, "url_cover": res.url, "failed": res.failed})
+        results.append({
+            "id": item.id,
+            "url_cover": res.url,
+            "failed": res.failed,
+            "error": res.error,
+        })
     return results
 
 

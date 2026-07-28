@@ -84,6 +84,70 @@ class TestFetchCover:
         assert res.failed is False
 
 
+class TestCause:
+    """La cause de l'échec REMONTE À L'APPELANT.
+
+    🔴 Elle ne peut pas être journalisée sur place : l'exe est construit
+    `console=False`, une trace imprimée n'irait nulle part. Sans ce champ, un
+    quota dépassé, un jeton refusé et une release disparue se lisaient d'un même
+    « réseau ou quota » — trois corrections différentes sous un seul message.
+    Mesuré au terrain le 2026-07-28 : 58 % d'échecs, cause inconnue.
+    """
+
+    def test_le_succes_ne_porte_aucune_cause(self, with_client):
+        with_client([{"uri": "https://i.discogs.com/abc.jpeg"}])
+        assert cover_fetcher.fetch_cover(3235).error is None
+
+    def test_absence_certaine_non_plus(self, with_client):
+        with_client([])
+        assert cover_fetcher.fetch_cover(3235).error is None
+
+    def test_la_panne_nomme_son_type_et_son_message(self, with_client):
+        with_client(None)
+        err = cover_fetcher.fetch_cover(3235).error
+        assert "ConnectionError" in err
+        assert "réseau indisponible" in err
+
+    def test_le_jeton_absent_le_dit_en_clair(self, monkeypatch):
+        monkeypatch.setattr(cover_fetcher, "get_client", lambda: None)
+        assert cover_fetcher.fetch_cover(3235).error == "jeton Discogs absent"
+
+    def test_le_code_http_est_extrait_quand_il_existe(self, monkeypatch):
+        """C'est LUI qui sépare un quota (429) d'un jeton refusé (401)."""
+
+        class HTTPError(Exception):
+            status_code = 429
+
+        class Boom:
+            def release(self, _id):
+                raise HTTPError("too many requests")
+
+        monkeypatch.setattr(cover_fetcher, "get_client", lambda: Boom())
+        err = cover_fetcher.fetch_cover(3235).error
+        assert "429" in err
+        assert "too many requests" in err
+
+    def test_message_long_tronque(self, monkeypatch):
+        """Le champ voyage dans une réponse JSON par morceau : pas de pavé."""
+
+        class Boom:
+            def release(self, _id):
+                raise RuntimeError("x" * 500)
+
+        monkeypatch.setattr(cover_fetcher, "get_client", lambda: Boom())
+        assert len(cover_fetcher.fetch_cover(3235).error) < 200
+
+    def test_exception_sans_message(self, monkeypatch):
+        """Ne doit pas produire un « RuntimeError: » orphelin."""
+
+        class Boom:
+            def release(self, _id):
+                raise RuntimeError()
+
+        monkeypatch.setattr(cover_fetcher, "get_client", lambda: Boom())
+        assert cover_fetcher.fetch_cover(3235).error == "RuntimeError"
+
+
 class TestGetCoverUrl:
     """La forme simplifiée, utilisée par /match et /match/batch."""
 

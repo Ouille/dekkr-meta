@@ -41,16 +41,37 @@ class CoverResult(NamedTuple):
     url: str | None
     #: L'appel lui-même a échoué (réseau, quota, jeton refusé) — réessayable.
     failed: bool
+    #: Cause de l'échec en clair, `None` si tout s'est bien passé. Voir `_describe`.
+    error: str | None = None
+
+
+def _describe(e: Exception) -> str:
+    """Résumé lisible d'une exception, pour voyager dans la réponse HTTP.
+
+    🔴 La cause REMONTE À L'APPELANT, elle n'est pas imprimée. L'exe est construit
+    avec `console=False` (`build.spec`) : un `print` ou un log console n'irait
+    nulle part, et donnerait l'illusion d'une trace. C'est déjà ce qui avait
+    avalé l'exception d'enregistrement du jeton.
+
+    Le code HTTP est extrait quand il existe : c'est LUI qui distingue un quota
+    dépassé (429) d'un jeton refusé (401) ou d'une release disparue (404), et
+    ces trois cas n'appellent pas la même correction.
+    """
+    status = getattr(e, "status_code", None)
+    detail = str(e).strip()[:120]
+    if status is not None:
+        return f"{type(e).__name__} {status}: {detail}" if detail else f"{type(e).__name__} {status}"
+    return f"{type(e).__name__}: {detail}" if detail else type(e).__name__
 
 
 def fetch_cover(release_id: int) -> CoverResult:
     client = get_client()
     if client is None:
-        return CoverResult(None, failed=True)
+        return CoverResult(None, failed=True, error="jeton Discogs absent")
     try:
         images = client.release(release_id).fetch("images")
-    except Exception:
-        return CoverResult(None, failed=True)
+    except Exception as e:
+        return CoverResult(None, failed=True, error=_describe(e))
     # Réponse obtenue : une release sans image est une absence CERTAINE.
     if images:
         return CoverResult(images[0].get("uri"), failed=False)
